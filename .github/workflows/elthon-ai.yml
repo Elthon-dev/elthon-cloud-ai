@@ -1,0 +1,294 @@
+
+name: Elthon Cloud AI
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch in your private project"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run-agent:
+    name: Pi + Qwen3.5 Cloud Agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+
+      - name: Checkout Private Project
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: project
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install Ollama
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsSL https://ollama.com/install.sh \
+            -o "$RUNNER_TEMP/install-ollama.sh"
+
+          sh "$RUNNER_TEMP/install-ollama.sh" \
+            > "$RUNNER_TEMP/ollama-install.log" 2>&1
+
+          sudo mkdir -p \
+            /etc/systemd/system/ollama.service.d
+
+          sudo tee \
+            /etc/systemd/system/ollama.service.d/override.conf \
+            >/dev/null <<'EOF'
+          [Service]
+          Environment="OLLAMA_CONTEXT_LENGTH=8192"
+          Environment="OLLAMA_NUM_PARALLEL=1"
+          Environment="OLLAMA_NO_CLOUD=1"
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now ollama
+          sudo systemctl restart ollama
+
+          for i in $(seq 1 60); do
+            if curl -fsS \
+              http://127.0.0.1:11434/api/tags \
+              >/dev/null; then
+              echo "Ollama is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::Ollama failed to start."
+          exit 1
+
+      - name: Select Model Based on Available Storage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AVAILABLE_GB="$(
+            df -BG --output=avail / |
+            tail -n 1 |
+            tr -dc '0-9'
+          )"
+
+          echo "Available disk space: ${AVAILABLE_GB} GB"
+
+          if (( AVAILABLE_GB >= 9 )); then
+            MODEL_ID="qwen3.5:9b-q4_K_M"
+          elif (( AVAILABLE_GB >= 5 )); then
+            MODEL_ID="qwen3.5:4b-q4_K_M"
+          else
+            echo "::error::Insufficient disk space for the model."
+            exit 1
+          fi
+
+          echo "MODEL_ID=$MODEL_ID" >> "$GITHUB_ENV"
+
+          echo "Selected model: $MODEL_ID"
+
+      - name: Download AI Model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ollama pull "$MODEL_ID"
+
+          ollama list
+
+      - name: Install Pi
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm config set prefix "$HOME/.npm-global"
+
+          export PATH="$HOME/.npm-global/bin:$PATH"
+
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+          npm install -g @earendil-works/pi-coding-agent
+
+          pi --version
+
+      - name: Configure Pi Model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.pi/agent"
+
+          cat > "$HOME/.pi/agent/models.json" <<EOF
+          {
+            "$schema": "https://pi.dev/schemas/models.schema.json",
+            "providers": {
+              "ollama": {
+                "baseUrl": "http://127.0.0.1:11434/v1",
+                "api": "openai-completions",
+                "apiKey": "ollama",
+                "models": [
+                  {
+                    "id": "$MODEL_ID",
+                    "name": "Elthon Qwen3.5",
+                    "contextWindow": 8192,
+                    "maxTokens": 4096,
+                    "input": ["text"]
+                  }
+                ]
+              }
+            }
+          }
+          EOF
+
+      - name: Run AI Coding Agent
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s AI_TASK.md ]]; then
+            echo "::error::AI_TASK.md is missing or empty."
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/agent-preamble.txt" <<'EOF'
+          You are Elthon Cloud AI.
+
+          Your responsibilities:
+
+          - Understand the project's architecture.
+          - Read relevant files before editing.
+          - Follow project instructions where appropriate.
+          - Write clean, maintainable code.
+          - Execute relevant tests.
+          - Fix issues you discover when relevant.
+          - Explain important changes in your final response.
+
+          Safety requirements:
+
+          - Never expose credentials or private keys.
+          - Never upload private source code externally.
+          - Avoid destructive commands.
+          - Do not modify AI_TASK.md.
+          - Do not change unrelated files.
+
+          Complete the user's task using your available tools.
+          EOF
+
+          {
+            cat "$RUNNER_TEMP/agent-preamble.txt"
+            printf '\n\nUSER TASK:\n'
+            cat AI_TASK.md
+          } > "$RUNNER_TEMP/agent-prompt.txt"
+
+          if ! pi \
+            --provider ollama \
+            --model "$MODEL_ID" \
+            --no-session \
+            --print \
+            --tools read,bash,edit,write,grep,find,ls \
+            "Complete the supplied task in this repository." \
+            < "$RUNNER_TEMP/agent-prompt.txt" \
+            > "$RUNNER_TEMP/AI_RESPONSE.md" \
+            2> "$RUNNER_TEMP/pi-errors.log"; then
+
+            echo "::error::Pi execution failed. Check the installation and model steps."
+            exit 1
+          fi
+
+          test -s "$RUNNER_TEMP/AI_RESPONSE.md"
+
+          mkdir -p .elthon
+
+          mv "$RUNNER_TEMP/AI_RESPONSE.md" \
+            .elthon/AI_RESPONSE.md
+
+          echo "AI task completed."
+
+      - name: Prepare Private Changes
+        id: commit
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git restore --source=HEAD -- AI_TASK.md
+
+          AI_BRANCH="elthon-ai-${GITHUB_RUN_ID}"
+
+          git switch -c "$AI_BRANCH"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Stop if common credential files were modified or added.
+          if git diff --cached --name-only |
+            grep -Eiq '(^|/)\.env($|\.)|(^|/)(id_rsa|id_ed25519)(\.pub)?$|\.(pem|p12|pfx|key)$'; then
+            echo "::error::Potential credential file detected. Review changes manually."
+            exit 1
+          fi
+
+          git config user.name "Elthon Cloud AI"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "Elthon AI: automated changes"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$AI_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Push Changes to Private Repository
+        if: steps.commit.outputs.changed == 'true'
+        working-directory: project
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          AI_BRANCH: ${{ steps.commit.outputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/askpass.sh" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$PRIVATE_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+
+          chmod 700 "$RUNNER_TEMP/askpass.sh"
+
+          GIT_ASKPASS="$RUNNER_TEMP/askpass.sh" \
+          GIT_TERMINAL_PROMPT=0 \
+          git push --quiet origin "HEAD:refs/heads/$AI_BRANCH"
+
+          echo "Private branch pushed successfully."
+
+      - name: Report Result
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "## Elthon Cloud AI"
+            echo "The coding job completed."
+            echo "Check your private repository for the generated branch."
+          } >> "$GITHUB_STEP_SUMMARY"
